@@ -28,7 +28,7 @@ Read `app/main.py` to see the reference implementation. The container is built f
 The gateway has already verified the user. The container receives authenticated requests with the user's identity in headers:
 
 - `X-Forwarded-User`: User's email (e.g., `alice@example.com`)
-- `X-Forwarded-Groups`: this app's own groups and nothing else, comma-separated (e.g., `inno-app-name-users,inno-app-name-open`). It carries `inno-<app>-users` when the caller is a member and `inno-<app>-open` while the app is open to everyone. It never names the platform admin group or any other app's groups, so a finer in-app role needs your own role store keyed on `X-Forwarded-User`. This narrowing reaches a `container` app with its next deploy on the platform v0.14.3 gateway (one deployed earlier still receives its other groups until then) and applies to an `mcp-container` app already. (On an open `mcp-container` app it can be empty for a non-member who was just admitted: treat that as "not a member".)
+- `X-Forwarded-Groups`: this app's own groups and nothing else, comma-separated. It carries your app's members group (`get_platform_status` names it under App groups) when the caller is a member, and its open group while the app is open to everyone. It never names the platform admin group or any other app's groups, so a finer in-app role needs your own role store keyed on `X-Forwarded-User`. This narrowing reaches a `container` app with its next deploy on the platform v0.14.3 gateway (one deployed earlier still receives its other groups until then) and applies to an `mcp-container` app already. (On an open `mcp-container` app it can be empty for a non-member who was just admitted: treat that as "not a member".)
 
 The gateway also sets `X-Forwarded-Host` (the hostname the request arrived on), `X-Forwarded-Proto` (always `https`) and `X-Forwarded-For` (the client address from Cloudflare's edge, absent when unknown), deletes `Forwarded`, and drops the Cloudflare Access cookies. Every other header, including `X-Real-IP`, `True-Client-IP` and `X-Forwarded-Port`, is whatever the client sent: never use one for identity or an access decision.
 
@@ -62,7 +62,7 @@ Replace `{ACCESS_TEAM_DOMAIN}` with the team domain emitted by the platform MCP'
 
 In local dev there is no gateway in front of the container (see the README's "Running Locally"), so nothing strips identity headers — mock a user by passing them directly to your app:
 - Pass `-H 'X-Forwarded-User: alice@example.com'` to set the user.
-- Pass `-H 'X-Forwarded-Groups: inno-<app>-users'` to set groups.
+- Pass `-H 'X-Forwarded-Groups: <your app's members group>'` to set groups.
 
 ## Persistence (use the storage client)
 
@@ -129,16 +129,18 @@ except NotConnected as e:
 Connections are configured by the app's owner with the `set_app_connection`
 MCP tool (or the panel's Connections tab). Availability today (contract
 §2.2): the seam is live for **mcp-container** apps; the sso-`container`
-gateway does not carry it yet (the call answers 501), and function-shaped
-apps have no `storage.internal` at all. The helper ships in both clients now
-so container apps are ready as availability widens.
+gateway binds `PLATFORM` but carries no caller assertion, so the platform
+answers 400 `bad_request` (the 501 comes only from a gateway deployed from an
+old config), and function-shaped apps have no `storage.internal` at all. The
+helper ships in both clients now so container apps are ready as availability
+widens.
 
 ## Container contract
 
 The container must adhere to these requirements:
 
 1. **Listen on port 8080** — The gateway forwards all traffic to this port.
-2. **Serve `/healthz` endpoint** — Return HTTP 200 if healthy, cheap and storage-independent. Two platform checks bind to it (contract R2): CI's smoke gate (the built image must answer within 90s of `docker run`) and the runtime health probe, fired after each green deploy and then daily — failures notify the owner and surface in the panel's Health column.
+2. **Serve `/healthz` endpoint.** Return HTTP 200 if healthy, cheap and storage-independent. Two platform checks bind to it (contract R2): CI's smoke gate (the built image must answer within 90s of `docker run`) and the runtime health probe, fired after each green deploy and then every `health.probe_interval_hours` hours (24 by default): failures notify the owner and surface in the panel's Health column.
 3. **Run as non-root** — The Dockerfile must create a non-root user and switch to it before running your app. The reference Dockerfile uses `useradd -m appuser && USER appuser`.
 4. **Graceful shutdown** — The container will receive SIGTERM; handle it cleanly.
 
