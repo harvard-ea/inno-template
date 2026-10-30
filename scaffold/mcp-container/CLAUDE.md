@@ -6,13 +6,15 @@ This template guides you to build a secure MCP server in a container on the Inno
 
 This is an mcp-container-type application: your app is a container that speaks the
 Model Context Protocol (MCP), reached by MCP clients (Claude Code, claude.ai) over
-OAuth instead of a browser login. The platform's gateway sits in front as an OAuth
+OAuth instead of a browser login. The platform's front door sits in front as an OAuth
 2.1 Resource Server: it verifies the caller's platform-issued bearer token (minted
 by the platform's Authorization Server, audience-bound to THIS app) and forwards
 the request to your container with spoof-proof identity headers.
 
-- **Gateway**: platform-owned, injected at deploy time; never edit or vendor it.
+- **Front door**: platform-owned and never part of this repo.
   It is the OAuth boundary; your container never sees or parses a token.
+- **Host**: platform-owned and never part of this repo; it runs your container
+  and serves its storage.
 - **Your container**: built from `Dockerfile`, serving port 8080. The reference
   server is `app/main.py`, a Python FastMCP server answering `POST /mcp`.
 - **Storage**: your app's own D1 and R2, reached through `app/storage.py`.
@@ -25,31 +27,58 @@ contract works (`get_app_contract` serves it, with current base images).
 
 **Do not build authentication, sessions, OAuth, or token parsing.**
 
-The gateway has already verified the caller's OAuth bearer token (the
-`Authorization` header never reaches your container) and injects spoof-proof
-headers on every forwarded request:
+The front door decides who reaches the app and tells you who the caller is, in the
+identity headers. It checks the caller's OAuth bearer token (the `Authorization`
+header never reaches your container) and sets these spoof-proof headers on every
+forwarded request (contract R3 names the full set, `X-Forwarded-Email` among them):
 
-- `X-Forwarded-User`: the user's email (e.g. `alice@example.com`)
-- `X-Forwarded-Groups`: comma-separated, and only this app's own groups:
-  your app's members group (`get_platform_status` names it under App
-  groups) for a member, its open group while the app is open to
-  everyone. It never names the admin group or another app's groups. On an open
-  app it can be empty for a non-member who was just admitted: treat that as
-  "not a member".
+- `X-Forwarded-User`: the caller's email (e.g. `alice@example.com`), empty when
+  the caller has no identity
+- `X-Forwarded-Subject`: the caller's identity provider ID, which stays with the
+  person when an address passes to someone else; empty when the caller has no
+  identity
+- `X-Forwarded-Groups`: at most one group, your app's members group
+  (`get_platform_status` names it under App groups), present for a member
+  and empty for every other caller. It never names the admin group or another
+  app's groups. Admission is decided before the header is written, not from
+  it: an app widened to internal admits anyone who signs in, and a caller who
+  is not a member arrives with the header empty. It is decided at each
+  request, from the platform's member list for the app and the app's
+  audience, so a grant, a revoke or a change to the app's audience reaches
+  the header within the front door's introspection cache (60 seconds at most).
+
+Each request's caller is one of three: a member (`X-Forwarded-Groups` includes the app's `-users` group), signed in but not a member (an identity without that group), or anonymous (empty identity headers). The platform decides who reaches the app; the app decides, per request, what each caller may see and do, and never assumes a caller is a member. Per-person data and roles exist only for an identified caller; a caller with no identity gets only what is meant for anyone.
 
 In a tool, take `ctx: Context` and call `current_user(ctx.request_context.request)`
-from `storage.py`, as `whoami` does. Authorize by user, or by membership versus
-open access; a finer role needs your own store keyed on `X-Forwarded-User`. Never
-trust what the client claims about itself. No sign-out link (no browser session).
+from `storage.py`, as `whoami` does. It returns `None` when the request carries no
+identity, otherwise the email, the groups, `member` and `subject` (`None` only
+when the request carries no `X-Forwarded-Subject`). Key per-person rows on
+`subject`, the person's identity provider ID; the address can pass to someone
+else. Handle no user first, and a missing `subject` with it, before any per-user
+read or write: refuse, or answer with what is meant for anyone (contract §3), and
+never default the absence back into a value (`or ""`, `"unknown"`). Then
+authorize by user (`user["subject"]`, never an id the model supplied), or by
+membership (`user["member"]`, false for a signed-in non-member); a finer role needs your own
+store keyed on `X-Forwarded-Subject`. Never trust what the client
+claims about itself. Refuse inside MCP, never with an HTTP status (contract
+§1.3, a MUST): raise from the tool, and FastMCP answers with a tool result
+marked as an error, as the example below does. No sign-out link (no browser
+session).
 
 ## Persistence (use the storage client)
 
 Container disk and memory are lost on restart or idle sleep: never persist to local
 files or SQLite. Use `Storage` from `storage.py`; its default `http://storage.internal`
-is routed by the gateway to your D1 and R2 (leave `INNO_STORAGE_BASE` unset):
+is routed by the platform's host to your D1 and R2 (leave `INNO_STORAGE_BASE` unset):
 
 ```python
-rows = await Storage().query("SELECT * FROM notes WHERE owner = ?", [email])
+from mcp.server.fastmcp.exceptions import ToolError
+
+# in a tool that takes ctx: Context
+user = current_user(ctx.request_context.request)
+if user is None or user["subject"] is None:
+    raise ToolError("no signed-in user")  # a tool result marked as an error, never an HTTP status
+rows = await Storage().query("SELECT * FROM notes WHERE owner = ?", [user["subject"]])
 ```
 
 Create tables at first use (D1 is empty on provision). **Connections** (per-user
@@ -59,23 +88,47 @@ are live for this type: pass the inbound `X-Caller-Assertion` through, never dec
 ```python
 try:
     cred = await Connections().get("servicenow", ctx.request_context.request.headers.get("x-caller-assertion"))
-except ConnectionLocked:  # catch first (a NotConnected subclass): reconnect the MCP client
+except ConnectionLocked:  # catch first (a NotConnected subclass): the user re-authorizes the MCP client
     ...
 except NotConnected as e:  # relay e.connect_url to the user verbatim
     ...
 ```
+
+Any other failed seam call raises `ConnectionsError`, an `httpx.HTTPStatusError`
+carrying the HTTP `status` and the answer's `error` code as `code` (contract §2.2
+says which codes are yours to fix), and `Storage().list_files()` returns the list
+of keys with a `truncated` attribute, true when the platform stopped listing at its cap.
+
+A source app linked to this one (`link_app_data`,
+contract §2.1) is reached with `query_linked` and `execute_linked` for its
+database, and `put_linked_file`, `get_linked_file`, `list_linked_files` and
+`delete_linked_file` for its files: the grant is read-write, over the source's
+database and every one of its files.
+
+**Files someone uploaded.** If the server hands a stored file to a browser, it
+serves it only as a download, with the headers `file_download_headers(filename)`
+returns (`fileDownloadHeaders(filename)` in JS): `Content-Disposition: attachment`,
+`X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox`. The rule
+holds from any host (APP-SECURITY §3), this one included: for a visitor's
+submission, for a file an editor app put here (a visitor's upload republished by an
+editor among them), and for every file read from a linked source with
+`get_linked_file`. Every app shares one site, so an uploaded HTML or SVG file shown
+inline could run script beside every other app.
 
 ## Container contract
 
 - Listen on `0.0.0.0:8080` with `EXPOSE 8080`, and run as a non-root `USER`
   (APP-CONTRACT R1: a plain uid from 1 to 2147483647, or a portable name on one
   clean `/etc/passwd` line with such a uid, as the reference `useradd -m appuser`
-  writes). The `Dockerfile` serves `main:app`. Handle SIGTERM cleanly. After a deploy,
-  a running instance keeps the old image until it sleeps or you run `restart_app`.
-  An idle container sleeps (`container.sleep_after`, default 10 minutes) and wakes
+  writes). The `Dockerfile` serves `main:app`. Handle SIGTERM cleanly. Any change
+  to the app's code, its values or the platform's host starts a new container
+  instance on the next request. An idle container sleeps (`container.sleep_after`, default 10 minutes) and wakes
   on the next request, so the first call after idle is slower.
 - `GET /healthz` must return 200 without touching storage (R2): CI's smoke gate
-  wants it within 90s of `docker run`, and the platform probes it after deploy and daily.
+  wants it within 90s of `docker run`, and the platform probes it after each green
+  deploy and then every `health.probe_interval_hours` hours (24 by default). The
+  probe allows one 45 second attempt and one retry 5 seconds later, so size the
+  boot for the first attempt.
 - `POST /mcp` is your MCP endpoint. **Stateless only** (`stateless_http=True`).
   This is a platform requirement, not a preference: there is no session store, so
   **server-initiated** MCP features do not work: no notifications, sampling,
@@ -84,9 +137,9 @@ except NotConnected as e:  # relay e.connect_url to the user verbatim
   on `/mcp` with 405: an open GET stream would only hold the container awake.
 - Keep `transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)`
   on `FastMCP(...)`: by default FastMCP accepts only localhost `Host` headers, and
-  every request the gateway proxies fails with `421 Invalid Host header`.
+  every proxied request fails with `421 Invalid Host header`.
 - Do not implement or route `/.well-known/oauth-protected-resource` (or its
-  path-inserted `.../mcp` variant): the gateway serves that RFC 9728 metadata.
+  path-inserted `.../mcp` variant): the front door serves that RFC 9728 metadata.
 - Register tools with `@mcp.tool()`; the signature is the input schema (see `echo`).
 - Do not add: anything under a root `src/`, a root `package.json`,
   `package-lock.json` or `tsconfig.json`, any `wrangler.*` config or `.wrangler/`
@@ -95,12 +148,14 @@ except NotConnected as e:  # relay e.connect_url to the user verbatim
 
 ## What CI enforces
 
-Every push to main runs the platform's safety gates (your preflight); tagging a
+Every push to the default branch runs the platform's safety gates (your preflight); tagging a
 `v*` release deploys. Gates: gitleaks (secrets), semgrep OWASP (SAST, over the
 whole repository except the platform-owned root `src/` and semgrep's
 default-ignored directories: `test/`, `tests/`, `build/`, `dist/`, `vendor/`,
 `node_modules/`, at any depth; `.semgrepignore` and `# nosemgrep` are not honored),
 pip-audit (`app/requirements.txt`), the container gates (`EXPOSE 8080`, non-root
-`USER`, `/healthz` smoke test, Trivy HIGH/CRITICAL on the image that deploys),
-config-integrity (this file's headers, no shadow configs), and release-age cooldown.
+`USER`, `/healthz` smoke test, Trivy HIGH/CRITICAL with a fix available on the
+image that deploys), config-integrity (this file's headers, no shadow configs), and
+release-age cooldown. The container job also writes an advisory Dockerfile
+misconfiguration report (`trivy config`) to the Actions run; it never fails the build.
 Deploys are skipped while `app/.needs-build` exists: delete it once real code lands.

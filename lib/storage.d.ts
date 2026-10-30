@@ -6,7 +6,13 @@ export interface StorageOptions {
 export interface CurrentUserResult {
   email: string;
   groups: string[];
+  member: boolean;
+  subject: string | null;
 }
+
+// The keys, an ordinary array, plus `truncated`: true when the platform stopped
+// listing at its cap, so the keys are only part of the bucket.
+export type FileListing = string[] & { truncated: boolean };
 
 export class Storage {
   constructor(opts?: StorageOptions);
@@ -14,13 +20,23 @@ export class Storage {
   execute(sql: string, params?: unknown[]): Promise<unknown>;
   queryLinked(sourceApp: string, sql: string, params?: unknown[]): Promise<unknown[]>;
   executeLinked(sourceApp: string, sql: string, params?: unknown[]): Promise<unknown>;
+  putLinkedFile(sourceApp: string, key: string, bytes: unknown): Promise<unknown>;
+  // Null only for a key the source's bucket lacks; a missing link throws.
+  getLinkedFile(sourceApp: string, key: string): Promise<Uint8Array | null>;
+  listLinkedFiles(sourceApp: string): Promise<FileListing>;
+  deleteLinkedFile(sourceApp: string, key: string): Promise<unknown>;
   putFile(key: string, bytes: unknown): Promise<unknown>;
   getFile(key: string): Promise<Uint8Array | null>;
-  listFiles(): Promise<string[]>;
+  listFiles(): Promise<FileListing>;
   deleteFile(key: string): Promise<unknown>;
 }
 
-export function currentUser(headers: Record<string, string> | Headers): CurrentUserResult;
+export function currentUser(headers: Record<string, string> | Headers): CurrentUserResult | null;
+
+// Content-Disposition (attachment, the name's characters outside A-Z, a-z,
+// 0-9, ".", "_" and "-" each replaced by "_"), X-Content-Type-Options and
+// Content-Security-Policy: serve a stored file with them (APP-SECURITY §3).
+export function fileDownloadHeaders(filename: string): Record<string, string>;
 
 export interface ConnectionsOptions {
   base?: string;
@@ -41,8 +57,17 @@ export class Connections {
 export class NotConnected extends Error {
   constructor(connectUrl: string);
   connectUrl: string;
+  // The same value under the name APP-CONTRACT §2.2 and the Python client use.
+  connect_url: string;
 }
 
 export class ConnectionLocked extends NotConnected {
   constructor(connectUrl: string);
+}
+
+export class ConnectionsError extends Error {
+  constructor(status: number, code: string | null);
+  status: number;
+  // The answer's `error` code, or null when the body carried none.
+  code: string | null;
 }

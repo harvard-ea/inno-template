@@ -1,7 +1,19 @@
 import os
+import re
 from urllib.parse import quote
 
 import httpx
+
+
+class FileList(list):
+    """The keys of a listing, an ordinary list, plus `truncated`.
+
+    `truncated` is True when the platform stopped listing at its cap (APP-CONTRACT R5),
+    so the keys are only part of the bucket. Track keys in D1 rather than walk a
+    bucket that size.
+    """
+
+    truncated: bool = False
 
 
 class Storage:
@@ -26,8 +38,9 @@ class Storage:
     async def execute(self, sql: str, params: list | None = None):
         return await self._post("/_storage/sql/execute", {"sql": sql, "params": params or []})
 
-    # Cross-app data links (APP-CONTRACT §2.1): the linked source app's D1,
-    # available only after the owner created the link and the app redeployed.
+    # Cross-app data links (APP-CONTRACT §2.1): the linked source app's D1 and
+    # its files, reachable once the owner has created the link and the platform
+    # has bound it to this app (its next deploy or restart, or a platform release).
     async def query_linked(self, source_app: str, sql: str, params: list | None = None):
         path = f"/_storage/linked/{quote(source_app, safe='')}/sql/query"
         return (await self._post(path, {"sql": sql, "params": params or []}))["results"]
@@ -35,6 +48,32 @@ class Storage:
     async def execute_linked(self, source_app: str, sql: str, params: list | None = None):
         path = f"/_storage/linked/{quote(source_app, safe='')}/sql/execute"
         return await self._post(path, {"sql": sql, "params": params or []})
+
+    async def put_linked_file(self, source_app: str, key: str, data: bytes):
+        path = f"/_storage/linked/{quote(source_app, safe='')}/files/{quote(key, safe='')}"
+        r = await self._request("PUT", path, content=data)
+        r.raise_for_status()
+        return r.json()
+
+    async def get_linked_file(self, source_app: str, key: str) -> bytes | None:
+        """The file's bytes, or None only for a key the source's bucket lacks: the
+        linked route answers 404 for a source with no deployed link too
+        (not_linked), which raises."""
+        path = f"/_storage/linked/{quote(source_app, safe='')}/files/{quote(key, safe='')}"
+        r = await self._request("GET", path)
+        if r.status_code == 404 and _error_code(r) == "not_found":
+            return None
+        r.raise_for_status()
+        return r.content
+
+    async def list_linked_files(self, source_app: str) -> FileList:
+        return await self._listing(f"/_storage/linked/{quote(source_app, safe='')}/files")
+
+    async def delete_linked_file(self, source_app: str, key: str):
+        path = f"/_storage/linked/{quote(source_app, safe='')}/files/{quote(key, safe='')}"
+        r = await self._request("DELETE", path)
+        r.raise_for_status()
+        return r.json()
 
     async def put_file(self, key: str, data: bytes):
         r = await self._request("PUT", f"/_storage/files/{quote(key, safe='')}", content=data)
@@ -48,26 +87,64 @@ class Storage:
         r.raise_for_status()
         return r.content
 
-    async def list_files(self) -> list:
-        r = await self._request("GET", "/_storage/files")
-        r.raise_for_status()
-        return r.json()["keys"]
+    async def list_files(self) -> FileList:
+        return await self._listing("/_storage/files")
 
     async def delete_file(self, key: str):
         r = await self._request("DELETE", f"/_storage/files/{quote(key, safe='')}")
         r.raise_for_status()
         return r.json()
 
+    async def _listing(self, path: str) -> FileList:
+        r = await self._request("GET", path)
+        r.raise_for_status()
+        out = r.json()
+        keys = FileList(out["keys"])
+        keys.truncated = out.get("truncated") is True
+        return keys
 
-def current_user(request) -> dict:
+
+def _error_code(r: httpx.Response) -> str | None:
+    """The `error` code a failed storage answer carries, or None when its body has none."""
+    try:
+        body = r.json()
+    except ValueError:
+        return None
+    return body["error"] if isinstance(body, dict) and isinstance(body.get("error"), str) else None
+
+
+def file_download_headers(filename: str) -> dict[str, str]:
+    """Headers for serving a stored file back to a browser (APP-SECURITY §3):
+    always a download, never rendered, so an uploaded HTML or SVG file cannot
+    run script on the site. Each character of the name outside A-Z, a-z, 0-9,
+    ".", "_" and "-" becomes "_", so the name cannot leave its quotes or the
+    header line."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", filename)
+    return {
+        "Content-Disposition": f'attachment; filename="{safe}"',
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "sandbox",
+    }
+
+
+def current_user(request) -> dict | None:
+    """The caller, or None when the request carries no identity (the platform's
+    health probe, or a local run without the headers). Never default the absence
+    into a value: code that needs a person handles None first. `subject` is the
+    caller's identity provider ID, None when the header is empty or missing; a
+    subject alone never makes a user."""
     h = request.headers
+    email = h.get("x-forwarded-user", "").strip()
+    if not email:
+        return None
     groups = [g.strip() for g in h.get("x-forwarded-groups", "").split(",") if g.strip()]
-    return {"email": h.get("x-forwarded-user", ""), "groups": groups}
+    subject = h.get("x-forwarded-subject", "").strip() or None
+    return {"email": email, "groups": groups, "member": any(g.endswith("-users") for g in groups), "subject": subject}
 
 
 class NotConnected(Exception):
     def __init__(self, connect_url: str):
-        super().__init__(f"not connected — open {connect_url} to link your account")
+        super().__init__(f"not connected: open {connect_url} to link your account")
         self.connect_url = connect_url
 
 
@@ -76,14 +153,30 @@ class ConnectionLocked(NotConnected):
 
     def __init__(self, connect_url: str):
         super().__init__(connect_url)
-        self.args = (f"connection locked: reconnect your MCP client to this app (or open {connect_url} while signed in) and try again",)
+        self.args = ("connection locked: re-authorize this app in your MCP client (in Claude: /mcp, then re-authenticate it), then try again",)
+
+
+class ConnectionsError(httpx.HTTPStatusError):
+    """A failed seam call: `status` is the HTTP status and `code` the answer's `error` code (None when the body carried none).
+
+    APP-CONTRACT §2.2 says which codes are the app's to fix and which mean retry later.
+    It is an httpx.HTTPStatusError, the error this call raised before the code was
+    kept, so an existing `except httpx.HTTPStatusError` still catches it.
+    """
+
+    def __init__(self, response: httpx.Response, code: str | None):
+        super().__init__(f"connections_error:{response.status_code}", request=response.request, response=response)
+        self.status = response.status_code
+        self.code = code
 
 
 # Per-user backend credentials (APP-CONTRACT §2.2). `caller_assertion` is the
-# value of THIS request's inbound X-Caller-Assertion header — the app must
+# value of THIS request's inbound X-Caller-Assertion header: the app must
 # echo it (identity rides only that platform-signed token). Returns a live
-# credential ({"access_token": ...} or {"header": ...}), or raises
-# NotConnected(connect_url) which the app relays to the user.
+# credential ({"access_token": ...} or {"header": ...}). Raises
+# NotConnected(connect_url), which the app relays to the user; ConnectionLocked,
+# a NotConnected the user fixes by re-authorizing the MCP client; or
+# ConnectionsError for any other failed seam call.
 class Connections:
     def __init__(self, base: str | None = None, client: httpx.AsyncClient | None = None):
         self.base = base or os.environ.get("INNO_STORAGE_BASE", "http://storage.internal")
@@ -96,7 +189,8 @@ class Connections:
         else:
             async with httpx.AsyncClient() as c:
                 r = await c.post(f"{self.base}/_connections/{name}", headers=headers)
-        r.raise_for_status()
+        if not r.is_success:
+            raise ConnectionsError(r, _error_code(r))
         out = r.json()
         if out.get("status") == "not_connected":
             raise (ConnectionLocked if out.get("locked") else NotConnected)(out.get("connect_url"))
