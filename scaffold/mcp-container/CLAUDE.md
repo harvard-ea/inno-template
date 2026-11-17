@@ -39,13 +39,17 @@ forwarded request (contract R3 names the full set, `X-Forwarded-Email` among the
   identity
 - `X-Forwarded-Groups`: at most one group, your app's members group
   (`get_platform_status` names it under App groups), present for a member
-  and empty for every other caller. It never names the admin group or another
-  app's groups. Admission is decided before the header is written, not from
-  it: an app widened to internal admits anyone who signs in, and a caller who
-  is not a member arrives with the header empty. It is decided at each
-  request, from the platform's member list for the app and the app's
-  audience, so a grant, a revoke or a change to the app's audience reaches
-  the header within the front door's introspection cache (60 seconds at most).
+  and empty for every other caller. It never names another app's groups or any
+  other group the caller belongs to. Admission is decided before the header is
+  written, not from it: an app widened to internal admits anyone who signs in,
+  and a caller who is not a member arrives with the header empty. It is
+  decided at each request, from the platform's member list for the app, the
+  app's identity provider group and the app's audience, so a grant, a revoke,
+  a change to that group at the identity provider or a change to the app's
+  audience reaches the header within the front door's introspection cache
+  (60 seconds at most). A change to that group counts its window from when
+  the identity provider's push of the change reaches the platform, not from
+  the edit at the identity provider, which pushes on its own schedule.
 
 Each request's caller is one of three: a member (`X-Forwarded-Groups` includes the app's `-users` group), signed in but not a member (an identity without that group), or anonymous (empty identity headers). The platform decides who reaches the app; the app decides, per request, what each caller may see and do, and never assumes a caller is a member. Per-person data and roles exist only for an identified caller; a caller with no identity gets only what is meant for anyone.
 
